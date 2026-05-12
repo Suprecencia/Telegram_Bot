@@ -1,123 +1,258 @@
 import os
 import logging
+import asyncio
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 import anthropic
+from supabase import create_client, Client
+from tavily import TavilyClient
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.enums import TA_LEFT
+import tempfile
+import base64
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# ── Config (set these as environment variables) ───────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+# ── Config ────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+SUPABASE_URL      = os.environ["SUPABASE_URL"]
+SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
+TAVILY_API_KEY    = os.environ["TAVILY_API_KEY"]
 
-# ── Claude client ─────────────────────────────────────────────────────────────
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ── Clients ───────────────────────────────────────────────────────────────────
+claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+tavily  = TavilyClient(api_key=TAVILY_API_KEY)
 
-# ── System Prompt (your assistant's personality) ──────────────────────────────
+# ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """
-You are a highly capable personal assistant for a devout Christian entrepreneur 
+You are a highly capable personal assistant for a devout Christian entrepreneur
 who owns a custom jewelry and lab-grown diamond business — the first of its kind in Indonesia.
 
 Your role covers 4 areas:
-1. **Jewelry & Diamond Expert** — You know about lab-grown diamonds, custom jewelry design, 
-   GIA certifications, 4Cs (cut, color, clarity, carat), pricing strategy, and the Indonesian 
-   luxury jewelry market.
+1. **Jewelry & Diamond Expert** — lab-grown diamonds, custom jewelry design,
+   GIA certifications, 4Cs, pricing strategy, Indonesian luxury jewelry market.
 
-2. **Christian Faith Perspective** — When asked about life, decisions, struggles, or 
-   biblical topics, you provide thoughtful, scripture-grounded answers with grace and wisdom.
+2. **Christian Faith Perspective** — When asked about life, decisions, struggles,
+   or biblical topics, provide thoughtful scripture-grounded answers with grace.
 
-3. **Content & Copywriting** — You help craft Instagram captions, marketing copy, product 
-   descriptions, email drafts, and business ideas that reflect an elegant, premium brand voice.
+3. **Content & Copywriting** — Instagram captions, marketing copy, product
+   descriptions, email drafts, business ideas with elegant premium brand voice.
 
-4. **General Smart Assistant** — For everything else, you are sharp, organized, and practical.
+4. **General Smart Assistant** — sharp, organized, practical for everything else.
 
-Language: Detect the language the user writes in. If they write in Bahasa Indonesia, 
-reply in Bahasa Indonesia. If in English, reply in English. If mixed, match their dominant language.
+Language: Auto-detect. Reply in Bahasa Indonesia if they write in Indonesian,
+English if they write in English. Match their dominant language if mixed.
 
 Tone: Warm, intelligent, professional — like a trusted advisor who genuinely cares.
-Never be robotic or generic. Always be specific and useful.
+
+Special commands the user can use:
+- If user says "SEARCH:" at the start → you will receive web search results to analyze
+- If user says "BUATKAN PDF:" or "MAKE PDF:" → create content and it will be saved as PDF
+- If user sends a photo → analyze it professionally (jewelry quality, design, etc.)
 """
 
-# ── Conversation memory (per user) ───────────────────────────────────────────
-conversation_history: dict[int, list] = {}
+# ── Supabase Memory ───────────────────────────────────────────────────────────
+def load_history(user_id: int, limit: int = 20) -> list:
+    try:
+        result = supabase.table("conversations") \
+            .select("role, content") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .limit(limit) \
+            .execute()
+        messages = [{"role": r["role"], "content": r["content"]} for r in reversed(result.data)]
+        return messages
+    except Exception as e:
+        logging.error(f"Load history error: {e}")
+        return []
 
-# ── /start command ─────────────────────────────────────────────────────────────
+def save_message(user_id: int, role: str, content: str):
+    try:
+        supabase.table("conversations").insert({
+            "user_id": user_id,
+            "role": role,
+            "content": content
+        }).execute()
+    except Exception as e:
+        logging.error(f"Save message error: {e}")
+
+def clear_history(user_id: int):
+    try:
+        supabase.table("conversations").delete().eq("user_id", user_id).execute()
+    except Exception as e:
+        logging.error(f"Clear history error: {e}")
+
+# ── PDF Generator ─────────────────────────────────────────────────────────────
+def create_pdf(content: str, title: str = "Dokumen") -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    doc = SimpleDocTemplate(tmp.name, pagesize=A4,
+                            leftMargin=2*cm, rightMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("Title", parent=styles["Heading1"], fontSize=16, spaceAfter=20)
+    body_style  = ParagraphStyle("Body",  parent=styles["Normal"],   fontSize=11, leading=18)
+
+    story = [
+        Paragraph(title, title_style),
+        Spacer(1, 0.5*cm),
+    ]
+    for line in content.split("\n"):
+        line = line.strip()
+        if line:
+            story.append(Paragraph(line.replace("**", "<b>").replace("**", "</b>"), body_style))
+            story.append(Spacer(1, 0.2*cm))
+
+    doc.build(story)
+    return tmp.name
+
+# ── Claude call ───────────────────────────────────────────────────────────────
+def ask_claude(messages: list, extra_system: str = "") -> str:
+    system = SYSTEM_PROMPT + ("\n\n" + extra_system if extra_system else "")
+    response = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1500,
+        system=system,
+        messages=messages
+    )
+    return response.content[0].text
+
+# ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Halo! I'm your personal assistant.\n\n"
-        "I can help you with:\n"
-        "💎 Jewelry & lab-grown diamond knowledge\n"
+        "👋 Halo! Saya asisten pribadi kamu yang sudah di-upgrade!\n\n"
+        "Kemampuan saya sekarang:\n"
+        "💎 Jewelry & lab-grown diamond expert\n"
         "✝️ Christian faith & biblical perspective\n"
-        "✍️ Content & copywriting for your brand\n"
-        "🧠 General smart assistance\n\n"
-        "Just type anything — in English or Bahasa Indonesia!"
+        "✍️ Content & copywriting\n"
+        "🔍 Web search — ketik: SEARCH: [pertanyaan]\n"
+        "🖼️ Analisa foto — kirim foto langsung!\n"
+        "📄 Buat PDF — ketik: BUATKAN PDF: [instruksi]\n"
+        "💾 Memory permanen — saya ingat semua percakapan kita!\n\n"
+        "Ketik /clear untuk reset memory.\nAda yang bisa saya bantu?"
     )
 
-# ── /clear command — reset conversation memory ────────────────────────────────
+# ── /clear ────────────────────────────────────────────────────────────────────
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conversation_history[user_id] = []
-    await update.message.reply_text("🧹 Memory cleared! Let's start fresh.")
+    clear_history(user_id)
+    await update.message.reply_text("🧹 Memory dihapus! Kita mulai percakapan baru.")
 
-# ── Main message handler ──────────────────────────────────────────────────────
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Photo handler ─────────────────────────────────────────────────────────────
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_text = update.message.text
+    caption = update.message.caption or "Tolong analisa gambar ini."
 
-    # Initialize history for new users
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-
-    # Add user message to history
-    conversation_history[user_id].append({
-        "role": "user",
-        "content": user_text
-    })
-
-    # Keep last 20 messages to avoid token overflow
-    if len(conversation_history[user_id]) > 20:
-        conversation_history[user_id] = conversation_history[user_id][-20:]
-
-    # Show typing indicator
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        # Call Claude API
-        response = client.messages.create(
+        photo = update.message.photo[-1]
+        file  = await context.bot.get_file(photo.file_id)
+        path  = tempfile.mktemp(suffix=".jpg")
+        await file.download_to_drive(path)
+
+        with open(path, "rb") as f:
+            image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+        response = claude.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1024,
+            max_tokens=1000,
             system=SYSTEM_PROMPT,
-            messages=conversation_history[user_id]
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
+                    {"type": "text", "text": caption}
+                ]
+            }]
         )
-
-        assistant_reply = response.content[0].text
-
-        # Save assistant reply to history
-        conversation_history[user_id].append({
-            "role": "assistant",
-            "content": assistant_reply
-        })
-
-        await update.message.reply_text(assistant_reply)
+        reply = response.content[0].text
+        save_message(user_id, "user", f"[Mengirim foto] {caption}")
+        save_message(user_id, "assistant", reply)
+        await update.message.reply_text(reply)
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text(
-            "⚠️ Sorry, something went wrong. Please try again in a moment."
-        )
+        logging.error(f"Photo error: {e}")
+        await update.message.reply_text("⚠️ Gagal menganalisa foto. Coba lagi ya.")
 
-# ── Run the bot ───────────────────────────────────────────────────────────────
+# ── Text handler ──────────────────────────────────────────────────────────────
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id  = update.effective_user.id
+    user_text = update.message.text.strip()
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        # ── PDF request ───────────────────────────────────────────────────────
+        if user_text.upper().startswith("BUATKAN PDF:") or user_text.upper().startswith("MAKE PDF:"):
+            instruction = user_text.split(":", 1)[1].strip()
+            history = load_history(user_id)
+            history.append({"role": "user", "content": f"Buatkan konten lengkap untuk PDF tentang: {instruction}. Tulis dalam format yang rapi dengan judul dan paragraf."})
+            content = ask_claude(history)
+
+            title = instruction[:50]
+            pdf_path = create_pdf(content, title)
+
+            save_message(user_id, "user", user_text)
+            save_message(user_id, "assistant", f"[PDF dibuat] {title}")
+
+            await update.message.reply_text(f"📄 Membuat PDF: *{title}*...", parse_mode="Markdown")
+            with open(pdf_path, "rb") as pdf_file:
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=pdf_file,
+                    filename=f"{title}.pdf"
+                )
+            return
+
+        # ── Web search request ────────────────────────────────────────────────
+        if user_text.upper().startswith("SEARCH:"):
+            query = user_text.split(":", 1)[1].strip()
+            await update.message.reply_text(f"🔍 Mencari: *{query}*...", parse_mode="Markdown")
+
+            results = tavily.search(query=query, max_results=5)
+            search_summary = "\n\n".join([
+                f"**{r['title']}**\n{r['content'][:300]}..."
+                for r in results.get("results", [])
+            ])
+
+            history = load_history(user_id)
+            history.append({"role": "user", "content": f"Berdasarkan hasil pencarian web berikut, jawab pertanyaan: {query}\n\nHasil pencarian:\n{search_summary}"})
+            reply = ask_claude(history, extra_system="You have been given real-time web search results. Analyze and summarize them clearly.")
+
+            save_message(user_id, "user", user_text)
+            save_message(user_id, "assistant", reply)
+            await update.message.reply_text(reply)
+            return
+
+        # ── Normal conversation ───────────────────────────────────────────────
+        history = load_history(user_id)
+        history.append({"role": "user", "content": user_text})
+        reply = ask_claude(history)
+
+        save_message(user_id, "user", user_text)
+        save_message(user_id, "assistant", reply)
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logging.error(f"Message error: {e}")
+        await update.message.reply_text("⚠️ Ada error. Coba lagi ya!")
+
+# ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Bot is running...")
     app.run_polling()

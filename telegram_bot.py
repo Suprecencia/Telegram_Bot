@@ -371,21 +371,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    scheduler = AsyncIOScheduler(timezone=WIB)
-    scheduler.add_job(
-        send_daily_report,
-        trigger="cron",
-        hour=9,
-        minute=0,
-        args=[app]
-    )
-    scheduler.start()
+    async def post_init(application):
+        scheduler = AsyncIOScheduler(timezone=WIB)
+        scheduler.add_job(
+            send_daily_report,
+            trigger="cron",
+            hour=9,
+            minute=0,
+            args=[application]
+        )
+        scheduler.start()
+
+    app.post_init = post_init
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("testreport", test_report))
-    app.add_handler(CommandHandler("clear", clear))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     print("✅ Bot is running...")
     app.run_polling()
-    

@@ -140,7 +140,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💾 Memory permanen — saya ingat semua percakapan kita!\n\n"
         "Ketik /clear untuk reset memory.\nAda yang bisa saya bantu?"
     )
-
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
+    await update.message.reply_text(
+        f"📋 Info ID:\n"
+        f"👤 User ID kamu: `{user_id}`\n"
+        f"💬 Chat ID ini: `{chat_id}`\n"
+        f"📌 Tipe chat: {chat_type}",
+        parse_mode="Markdown"
+    )
 # ── /clear ────────────────────────────────────────────────────────────────────
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -251,6 +261,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

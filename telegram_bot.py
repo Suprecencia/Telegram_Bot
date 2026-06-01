@@ -308,6 +308,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id  = update.effective_user.id
     user_text = update.message.text.strip()
+    chat_type = update.effective_chat.type
+
+    # Di grup, hanya respond jika:
+    # 1. Di-mention langsung (@botname)
+    # 2. Reply ke pesan bot
+    # 3. Owner atau team member
+    if chat_type in ["group", "supergroup"]:
+        is_mention = False
+        is_reply_to_bot = False
+
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == "mention":
+                    mentioned = user_text[entity.offset:entity.offset + entity.length]
+                    if "Myhumbleservant_Vic_bot" in mentioned or "Dikara_asisstant_bot" in mentioned:
+                        is_mention = True
+
+        if update.message.reply_to_message:
+            if update.message.reply_to_message.from_user.is_bot:
+                is_reply_to_bot = True
+
+        # Cek apakah owner atau team member
+        try:
+            team = supabase.table("team_members").select("user_id").execute()
+            team_ids = [str(m["user_id"]) for m in team.data]
+        except:
+            team_ids = []
+
+        is_authorized = str(user_id) == os.environ.get("OWNER_ID") or str(user_id) in team_ids
+
+        if not (is_mention or is_reply_to_bot) and not is_authorized:
+            return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 

@@ -387,9 +387,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ── Normal conversation ───────────────────────────────────────────────
+        # ── Normal conversation ───────────────────────────────────────────────
         history = load_history(user_id)
+        
+        # Paksa Bahasa Indonesia di grup Sales
+        chat_id = update.effective_chat.id
+        extra = ""
+        if chat_id == SALES_GROUP_ID:
+            extra = "PENTING: Selalu jawab dalam Bahasa Indonesia, apapun bahasa yang digunakan."
+        
         history.append({"role": "user", "content": user_text})
-        reply = ask_claude(history)
+        reply = ask_claude(history, extra_system=extra)
 
         save_message(user_id, "user", user_text)
         save_message(user_id, "assistant", reply)

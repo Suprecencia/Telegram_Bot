@@ -14,6 +14,8 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.enums import TA_LEFT
 import tempfile
 import base64
+import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -27,7 +29,9 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SUPABASE_URL      = os.environ["SUPABASE_URL"]
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
 TAVILY_API_KEY    = os.environ["TAVILY_API_KEY"]
-
+SALES_GROUP_ID      = -1003726241799
+MANAGEMENT_GROUP_ID = -1003787876162
+WIB                 = pytz.timezone("Asia/Jakarta")
 # ── Clients ───────────────────────────────────────────────────────────────────
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -127,6 +131,104 @@ def ask_claude(messages: list, extra_system: str = "") -> str:
     return response.content[0].text
 
 # ── /start ────────────────────────────────────────────────────────────────────
+async def send_daily_report(app):
+    today = datetime.now(WIB).strftime("%A, %d %B %Y")
+
+    await app.bot.send_message(
+        chat_id=MANAGEMENT_GROUP_ID,
+        text="⏳ Sedang menyiapkan laporan pagi... mohon tunggu sebentar."
+    )
+
+    # ── Search topics ────────────────────────────────────────────────────────
+    topics = [
+        "harga emas hari ini Indonesia",
+        "lab grown diamond tren harga 2025",
+        "tren perhiasan fashion Indonesia terbaru",
+        "kompetitor perhiasan diamond Indonesia",
+        "tren jewelry Instagram TikTok Indonesia"
+    ]
+    search_results = ""
+    for topic in topics:
+        try:
+            results = tavily.search(query=topic, max_results=3)
+            for r in results.get("results", []):
+                search_results += f"\n[{topic}]\n{r['title']}: {r['content'][:200]}\n"
+        except Exception as e:
+            logging.error(f"Search error for {topic}: {e}")
+
+    # ── Management report ────────────────────────────────────────────────────
+    mgmt_prompt = f"""
+Hari ini: {today}
+
+Berdasarkan data riset berikut, buatkan laporan pagi lengkap untuk tim MANAJEMEN Dikara 
+(bisnis perhiasan custom & lab-grown diamond pertama di Indonesia).
+
+Data riset:
+{search_results}
+
+Format laporan (gunakan emoji, bahasa Indonesia, tone profesional):
+🌅 SELAMAT PAGI - LAPORAN HARIAN DIKARA
+📅 Tanggal
+
+💰 UPDATE HARGA
+- Harga emas hari ini
+- Estimasi harga lab-grown diamond
+
+📊 TREN PASAR
+- Tren jewelry & diamond terkini
+- Tren fashion yang relevan
+
+🏆 KOMPETITOR
+- Update singkat kompetitor
+
+💡 REKOMENDASI STRATEGI
+- 2-3 rekomendasi actionable untuk Dikara hari ini
+
+✝️ FIRMAN PAGI
+- Ayat Alkitab yang relevan + refleksi singkat
+"""
+
+    mgmt_report = ask_claude([{"role": "user", "content": mgmt_prompt}])
+
+    # ── Sales report ─────────────────────────────────────────────────────────
+    sales_prompt = f"""
+Hari ini: {today}
+
+Berdasarkan data riset berikut, buatkan pesan pagi singkat & motivatif untuk tim SALES Dikara.
+Fokus pada insight yang langsung bisa dipakai untuk penawaran ke customer hari ini.
+
+Data riset:
+{search_results}
+
+Format (bahasa Indonesia, singkat, semangat):
+💎 GOOD MORNING DIKARA SALES TEAM!
+📅 Tanggal
+
+🔥 TREN HARI INI
+- 2-3 tren yang relevan untuk customer
+
+💡 IDE PENAWARAN HARI INI
+- 2-3 ide konkret untuk ditawarkan ke customer
+
+✝️ SEMANGAT PAGI
+- Ayat singkat + kalimat motivasi
+"""
+
+    sales_report = ask_claude([{"role": "user", "content": sales_prompt}])
+
+    # ── Send reports ─────────────────────────────────────────────────────────
+    try:
+        await app.bot.send_message(
+            chat_id=MANAGEMENT_GROUP_ID,
+            text=mgmt_report
+        )
+        await app.bot.send_message(
+            chat_id=SALES_GROUP_ID,
+            text=sales_report
+        )
+        logging.info("✅ Daily reports sent successfully")
+    except Exception as e:
+        logging.error(f"Send report error: {e}")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Halo! Saya asisten pribadi kamu yang sudah di-upgrade!\n\n"
@@ -260,6 +362,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    scheduler = AsyncIOScheduler(timezone=WIB)
+    scheduler.add_job(
+        send_daily_report,
+        trigger="cron",
+        hour=9,
+        minute=0,
+        args=[app]
+    )
+    scheduler.start()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("clear", clear))

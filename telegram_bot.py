@@ -15,6 +15,8 @@ from reportlab.lib.enums import TA_LEFT
 import tempfile
 import base64
 import pytz
+import httpx
+import json
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -29,9 +31,28 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SUPABASE_URL      = os.environ["SUPABASE_URL"]
 SUPABASE_KEY      = os.environ["SUPABASE_KEY"]
 TAVILY_API_KEY    = os.environ["TAVILY_API_KEY"]
+APIFY_API_KEY     = os.environ["APIFY_API_KEY"]
 SALES_GROUP_ID      = -1003726241799
 MANAGEMENT_GROUP_ID = -1003787876162
 WIB                 = pytz.timezone("Asia/Jakarta")
+
+# Kompetitor yang dipantau
+COMPETITOR_ACCOUNTS = [
+    "sol.et.terre",
+    "flawlessdiamonds.id",
+    "ladinjewellery",
+    "azurrdiamonds"
+]
+
+# Hashtag yang dipantau
+TRACKED_HASHTAGS = [
+    "labgrowndiamond",
+    "perhiasancustom",
+    "diamondIndonesia",
+    "engagementring",
+    "jewelry"
+]
+
 # ── Clients ───────────────────────────────────────────────────────────────────
 claude  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -63,6 +84,7 @@ Special commands the user can use:
 - If user says "SEARCH:" at the start → you will receive web search results to analyze
 - If user says "BUATKAN PDF:" or "MAKE PDF:" → create content and it will be saved as PDF
 - If user sends a photo → analyze it professionally (jewelry quality, design, etc.)
+- If user says "SOSMED:" → you will receive social media data to analyze
 """
 
 # ── Supabase Memory ───────────────────────────────────────────────────────────
@@ -130,7 +152,135 @@ def ask_claude(messages: list, extra_system: str = "") -> str:
     )
     return response.content[0].text
 
-# ── /start ────────────────────────────────────────────────────────────────────
+# ── Apify Social Media Scraper ────────────────────────────────────────────────
+async def scrape_instagram_profile(username: str) -> dict:
+    """Scrape Instagram profile data via Apify"""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Run the actor
+            run_response = await client.post(
+                f"https://api.apify.com/v2/acts/apify~instagram-profile-scraper/runs",
+                headers={"Authorization": f"Bearer {APIFY_API_KEY}"},
+                json={
+                    "usernames": [username],
+                    "resultsLimit": 5  # Ambil 5 post terbaru saja (hemat kuota)
+                }
+            )
+            run_data = run_response.json()
+            run_id = run_data.get("data", {}).get("id")
+            if not run_id:
+                return {}
+
+            # Tunggu selesai (max 30 detik)
+            for _ in range(10):
+                await asyncio.sleep(3)
+                status_resp = await client.get(
+                    f"https://api.apify.com/v2/actor-runs/{run_id}",
+                    headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
+                )
+                status = status_resp.json().get("data", {}).get("status")
+                if status == "SUCCEEDED":
+                    break
+                elif status in ["FAILED", "ABORTED"]:
+                    return {}
+
+            # Ambil hasilnya
+            dataset_id = status_resp.json().get("data", {}).get("defaultDatasetId")
+            result_resp = await client.get(
+                f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
+            )
+            items = result_resp.json()
+            return items[0] if items else {}
+
+    except Exception as e:
+        logging.error(f"Apify Instagram error for {username}: {e}")
+        return {}
+
+async def scrape_hashtag_tiktok(hashtag: str) -> list:
+    """Scrape TikTok hashtag data via Apify"""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            run_response = await client.post(
+                f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs",
+                headers={"Authorization": f"Bearer {APIFY_API_KEY}"},
+                json={
+                    "hashtags": [hashtag],
+                    "resultsPerPage": 5  # 5 video per hashtag (hemat kuota)
+                }
+            )
+            run_data = run_response.json()
+            run_id = run_data.get("data", {}).get("id")
+            if not run_id:
+                return []
+
+            for _ in range(10):
+                await asyncio.sleep(3)
+                status_resp = await client.get(
+                    f"https://api.apify.com/v2/actor-runs/{run_id}",
+                    headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
+                )
+                status = status_resp.json().get("data", {}).get("status")
+                if status == "SUCCEEDED":
+                    break
+                elif status in ["FAILED", "ABORTED"]:
+                    return []
+
+            dataset_id = status_resp.json().get("data", {}).get("defaultDatasetId")
+            result_resp = await client.get(
+                f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
+            )
+            return result_resp.json()
+
+    except Exception as e:
+        logging.error(f"Apify TikTok error for {hashtag}: {e}")
+        return []
+
+async def get_social_media_intel() -> str:
+    """Kumpulkan data sosmed dari kompetitor + hashtag tren"""
+    intel = ""
+
+    # Scrape 2 kompetitor saja per hari (hemat kuota free tier)
+    today_idx = datetime.now(WIB).day % len(COMPETITOR_ACCOUNTS)
+    accounts_today = COMPETITOR_ACCOUNTS[today_idx:today_idx+2]
+
+    intel += "\n=== DATA INSTAGRAM KOMPETITOR ===\n"
+    for username in accounts_today:
+        data = await scrape_instagram_profile(username)
+        if data:
+            followers = data.get("followersCount", "N/A")
+            posts = data.get("postsCount", "N/A")
+            bio = data.get("biography", "")
+            latest_posts = data.get("latestPosts", [])
+            intel += f"\n@{username}:\n"
+            intel += f"  Followers: {followers} | Posts: {posts}\n"
+            intel += f"  Bio: {bio[:100]}\n"
+            if latest_posts:
+                for p in latest_posts[:3]:
+                    likes = p.get("likesCount", 0)
+                    caption = p.get("caption", "")[:80]
+                    intel += f"  📸 [{likes} likes] {caption}\n"
+        else:
+            intel += f"\n@{username}: Data tidak tersedia\n"
+
+    # Scrape 2 hashtag TikTok
+    intel += "\n=== TREN TIKTOK ===\n"
+    for hashtag in TRACKED_HASHTAGS[:2]:
+        videos = await scrape_hashtag_tiktok(hashtag)
+        if videos:
+            intel += f"\n#{hashtag}:\n"
+            for v in videos[:3]:
+                views = v.get("playCount", 0)
+                likes = v.get("diggCount", 0)
+                desc = v.get("text", "")[:80]
+                intel += f"  🎵 [{views:,} views | {likes:,} likes] {desc}\n"
+        else:
+            intel += f"\n#{hashtag}: Data tidak tersedia\n"
+
+    return intel
+
+# ── Daily Report ──────────────────────────────────────────────────────────────
 async def send_daily_report(app):
     today = datetime.now(WIB).strftime("%A, %d %B %Y")
 
@@ -139,7 +289,7 @@ async def send_daily_report(app):
         text="⏳ Sedang menyiapkan laporan pagi... mohon tunggu sebentar."
     )
 
-    # ── Search topics ────────────────────────────────────────────────────────
+    # ── Web search ───────────────────────────────────────────────────────────
     topics = [
         "harga emas hari ini Indonesia",
         "lab grown diamond tren harga 2025",
@@ -156,6 +306,13 @@ async def send_daily_report(app):
         except Exception as e:
             logging.error(f"Search error for {topic}: {e}")
 
+    # ── Social media intel ───────────────────────────────────────────────────
+    try:
+        social_data = await get_social_media_intel()
+    except Exception as e:
+        logging.error(f"Social media intel error: {e}")
+        social_data = "Data sosmed tidak tersedia hari ini."
+
     # ── Management report ────────────────────────────────────────────────────
     mgmt_prompt = f"""
 Hari ini: {today}
@@ -163,8 +320,11 @@ Hari ini: {today}
 Berdasarkan data riset berikut, buatkan laporan pagi lengkap untuk tim MANAJEMEN Dikara 
 (bisnis perhiasan custom & lab-grown diamond pertama di Indonesia).
 
-Data riset:
+Data riset web:
 {search_results}
+
+Data sosial media kompetitor & tren:
+{social_data}
 
 Format laporan (gunakan emoji, bahasa Indonesia, tone profesional):
 🌅 SELAMAT PAGI - LAPORAN HARIAN DIKARA
@@ -177,6 +337,10 @@ Format laporan (gunakan emoji, bahasa Indonesia, tone profesional):
 📊 TREN PASAR
 - Tren jewelry & diamond terkini
 - Tren fashion yang relevan
+
+📱 INTEL SOSMED
+- Update kompetitor Instagram hari ini
+- Tren TikTok yang relevan
 
 🏆 KOMPETITOR
 - Update singkat kompetitor
@@ -200,12 +364,18 @@ Fokus pada insight yang langsung bisa dipakai untuk penawaran ke customer hari i
 Data riset:
 {search_results}
 
+Data sosmed tren:
+{social_data}
+
 Format (bahasa Indonesia, singkat, semangat):
 💎 GOOD MORNING DIKARA SALES TEAM!
 📅 Tanggal
 
 🔥 TREN HARI INI
 - 2-3 tren yang relevan untuk customer
+
+📱 SOSMED INSIGHT
+- 1-2 konten/tren yang lagi viral, bisa dijadikan bahan ngobrol dengan customer
 
 💡 IDE PENAWARAN HARI INI
 - 2-3 ide konkret untuk ditawarkan ke customer
@@ -218,17 +388,13 @@ Format (bahasa Indonesia, singkat, semangat):
 
     # ── Send reports ─────────────────────────────────────────────────────────
     try:
-        await app.bot.send_message(
-            chat_id=MANAGEMENT_GROUP_ID,
-            text=mgmt_report
-        )
-        await app.bot.send_message(
-            chat_id=SALES_GROUP_ID,
-            text=sales_report
-        )
+        await app.bot.send_message(chat_id=MANAGEMENT_GROUP_ID, text=mgmt_report)
+        await app.bot.send_message(chat_id=SALES_GROUP_ID, text=sales_report)
         logging.info("✅ Daily reports sent successfully")
     except Exception as e:
         logging.error(f"Send report error: {e}")
+
+# ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Halo! Saya asisten pribadi kamu yang sudah di-upgrade!\n\n"
@@ -237,11 +403,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✝️ Christian faith & biblical perspective\n"
         "✍️ Content & copywriting\n"
         "🔍 Web search — ketik: SEARCH: [pertanyaan]\n"
+        "📱 Sosmed intel — ketik: SOSMED: kompetitor/tren\n"
         "🖼️ Analisa foto — kirim foto langsung!\n"
         "📄 Buat PDF — ketik: BUATKAN PDF: [instruksi]\n"
         "💾 Memory permanen — saya ingat semua percakapan kita!\n\n"
         "Ketik /clear untuk reset memory.\nAda yang bisa saya bantu?"
     )
+
+# ── /myid ─────────────────────────────────────────────────────────────────────
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -253,6 +422,8 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 Tipe chat: {chat_type}",
         parse_mode="Markdown"
     )
+
+# ── /testreport ───────────────────────────────────────────────────────────────
 async def test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != int(os.environ.get("OWNER_ID", 0)):
@@ -261,6 +432,20 @@ async def test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Mengirim test report ke kedua grup...")
     await send_daily_report(context.application)
     await update.message.reply_text("✅ Test report selesai!")
+
+# ── /testsosmed ───────────────────────────────────────────────────────────────
+async def test_sosmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != int(os.environ.get("OWNER_ID", 0)):
+        await update.message.reply_text("⛔ Hanya owner yang bisa menjalankan ini.")
+        return
+    await update.message.reply_text("📱 Mengambil data sosmed... tunggu sekitar 1 menit ya.")
+    try:
+        data = await get_social_media_intel()
+        await update.message.reply_text(f"✅ Data sosmed berhasil:\n\n{data[:3000]}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 # ── /clear ────────────────────────────────────────────────────────────────────
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -310,10 +495,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     chat_type = update.effective_chat.type
 
-    # Di grup, hanya respond jika:
-    # 1. Di-mention langsung (@botname)
-    # 2. Reply ke pesan bot
-    # 3. Owner atau team member
     if chat_type in ["group", "supergroup"]:
         is_mention = False
         is_reply_to_bot = False
@@ -329,7 +510,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if update.message.reply_to_message.from_user.is_bot:
                 is_reply_to_bot = True
 
-        # Cek apakah owner atau team member
         try:
             team = supabase.table("team_members").select("user_id").execute()
             team_ids = [str(m["user_id"]) for m in team.data]
@@ -386,16 +566,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
             return
 
-        # ── Normal conversation ───────────────────────────────────────────────
+        # ── Social media request ──────────────────────────────────────────────
+        if user_text.upper().startswith("SOSMED:"):
+            query = user_text.split(":", 1)[1].strip()
+            await update.message.reply_text("📱 Mengambil data sosmed... tunggu sekitar 1 menit ya.")
+
+            social_data = await get_social_media_intel()
+
+            history = load_history(user_id)
+            history.append({"role": "user", "content": f"Berdasarkan data sosial media berikut, analisa dan jawab: {query}\n\nData sosmed:\n{social_data}"})
+            reply = ask_claude(history, extra_system="You have been given real social media data. Analyze competitor activity, engagement rates, and trends for Dikara jewelry business.")
+
+            save_message(user_id, "user", user_text)
+            save_message(user_id, "assistant", reply)
+            await update.message.reply_text(reply)
+            return
+
         # ── Normal conversation ───────────────────────────────────────────────
         history = load_history(user_id)
-        
-        # Paksa Bahasa Indonesia di grup Sales
+
         chat_id = update.effective_chat.id
         extra = ""
         if chat_id == SALES_GROUP_ID:
             extra = "PENTING: Selalu jawab dalam Bahasa Indonesia, apapun bahasa yang digunakan."
-        
+
         history.append({"role": "user", "content": user_text})
         reply = ask_claude(history, extra_system=extra)
 
@@ -428,6 +622,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("testreport", test_report))
+    app.add_handler(CommandHandler("testsosmed", test_sosmed))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

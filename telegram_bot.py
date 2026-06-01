@@ -253,6 +253,14 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 Tipe chat: {chat_type}",
         parse_mode="Markdown"
     )
+async def test_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != int(os.environ.get("OWNER_ID", 0)):
+        await update.message.reply_text("⛔ Hanya owner yang bisa menjalankan ini.")
+        return
+    await update.message.reply_text("🔄 Mengirim test report ke kedua grup...")
+    await send_daily_report(context.application)
+    await update.message.reply_text("✅ Test report selesai!")
 # ── /clear ────────────────────────────────────────────────────────────────────
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -374,6 +382,7 @@ if __name__ == "__main__":
     scheduler.start()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("testreport", test_report))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

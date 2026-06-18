@@ -145,7 +145,7 @@ def create_pdf(content: str, title: str = "Dokumen") -> str:
 def ask_claude(messages: list, extra_system: str = "") -> str:
     system = SYSTEM_PROMPT + ("\n\n" + extra_system if extra_system else "")
     response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1500,
         system=system,
         messages=messages
@@ -156,36 +156,48 @@ def ask_claude(messages: list, extra_system: str = "") -> str:
 async def scrape_instagram_profile(username: str) -> dict:
     """Scrape Instagram profile data via Apify"""
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Run the actor
+        async with httpx.AsyncClient(timeout=90) as client:
             run_response = await client.post(
                 f"https://api.apify.com/v2/acts/apify~instagram-profile-scraper/runs",
                 headers={"Authorization": f"Bearer {APIFY_API_KEY}"},
                 json={
                     "usernames": [username],
-                    "resultsLimit": 5  # Ambil 5 post terbaru saja (hemat kuota)
+                    "resultsLimit": 5
                 }
             )
             run_data = run_response.json()
             run_id = run_data.get("data", {}).get("id")
             if not run_id:
+                logging.warning(f"Apify: no run_id for {username}")
                 return {}
 
-            # Tunggu selesai (max 30 detik)
-            for _ in range(10):
+            # Tunggu selesai (max 60 detik = 20x poll tiap 3 detik)
+            status = None
+            status_resp = None
+            for _ in range(20):
                 await asyncio.sleep(3)
-                status_resp = await client.get(
-                    f"https://api.apify.com/v2/actor-runs/{run_id}",
-                    headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
-                )
-                status = status_resp.json().get("data", {}).get("status")
-                if status == "SUCCEEDED":
-                    break
-                elif status in ["FAILED", "ABORTED"]:
-                    return {}
+                try:
+                    status_resp = await client.get(
+                        f"https://api.apify.com/v2/actor-runs/{run_id}",
+                        headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
+                    )
+                    status = status_resp.json().get("data", {}).get("status")
+                    if status == "SUCCEEDED":
+                        break
+                    elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
+                        logging.warning(f"Apify run {status} for {username}")
+                        return {}
+                except Exception as poll_err:
+                    logging.warning(f"Poll error for {username}: {poll_err}")
+                    continue
 
-            # Ambil hasilnya
+            if status != "SUCCEEDED" or status_resp is None:
+                logging.warning(f"Apify did not succeed for {username}, status={status}")
+                return {}
+
             dataset_id = status_resp.json().get("data", {}).get("defaultDatasetId")
+            if not dataset_id:
+                return {}
             result_resp = await client.get(
                 f"https://api.apify.com/v2/datasets/{dataset_id}/items",
                 headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
@@ -200,33 +212,47 @@ async def scrape_instagram_profile(username: str) -> dict:
 async def scrape_hashtag_tiktok(hashtag: str) -> list:
     """Scrape TikTok hashtag data via Apify"""
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=90) as client:
             run_response = await client.post(
                 f"https://api.apify.com/v2/acts/clockworks~tiktok-scraper/runs",
                 headers={"Authorization": f"Bearer {APIFY_API_KEY}"},
                 json={
                     "hashtags": [hashtag],
-                    "resultsPerPage": 5  # 5 video per hashtag (hemat kuota)
+                    "resultsPerPage": 5
                 }
             )
             run_data = run_response.json()
             run_id = run_data.get("data", {}).get("id")
             if not run_id:
+                logging.warning(f"Apify TikTok: no run_id for {hashtag}")
                 return []
 
-            for _ in range(10):
+            status = None
+            status_resp = None
+            for _ in range(20):
                 await asyncio.sleep(3)
-                status_resp = await client.get(
-                    f"https://api.apify.com/v2/actor-runs/{run_id}",
-                    headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
-                )
-                status = status_resp.json().get("data", {}).get("status")
-                if status == "SUCCEEDED":
-                    break
-                elif status in ["FAILED", "ABORTED"]:
-                    return []
+                try:
+                    status_resp = await client.get(
+                        f"https://api.apify.com/v2/actor-runs/{run_id}",
+                        headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
+                    )
+                    status = status_resp.json().get("data", {}).get("status")
+                    if status == "SUCCEEDED":
+                        break
+                    elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
+                        logging.warning(f"Apify TikTok run {status} for {hashtag}")
+                        return []
+                except Exception as poll_err:
+                    logging.warning(f"TikTok poll error for {hashtag}: {poll_err}")
+                    continue
+
+            if status != "SUCCEEDED" or status_resp is None:
+                logging.warning(f"Apify TikTok did not succeed for {hashtag}, status={status}")
+                return []
 
             dataset_id = status_resp.json().get("data", {}).get("defaultDatasetId")
+            if not dataset_id:
+                return []
             result_resp = await client.get(
                 f"https://api.apify.com/v2/datasets/{dataset_id}/items",
                 headers={"Authorization": f"Bearer {APIFY_API_KEY}"}
@@ -472,7 +498,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_data = base64.standard_b64encode(f.read()).decode("utf-8")
 
         response = claude.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1000,
             system=SYSTEM_PROMPT,
             messages=[{

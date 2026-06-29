@@ -645,12 +645,26 @@ Format (bahasa Indonesia, singkat, semangat):
     sales_report = await ask_claude([{"role": "user", "content": sales_prompt}], use_tools=False)
 
     # ── Send reports ─────────────────────────────────────────────────────────
-    try:
-        await app.bot.send_message(chat_id=MANAGEMENT_GROUP_ID, text=mgmt_report)
-        await app.bot.send_message(chat_id=SALES_GROUP_ID, text=sales_report)
-        logging.info("✅ Daily reports sent successfully")
-    except Exception as e:
-        logging.error(f"Send report error: {e}")
+    async def safe_send(chat_id: int, text: str, label: str):
+        MAX_TG = 4096
+        try:
+            chunks = [text[i:i+MAX_TG] for i in range(0, len(text), MAX_TG)]
+            logging.info(f"{label}: {len(text)} chars → {len(chunks)} chunk(s)")
+            for chunk in chunks:
+                await app.bot.send_message(chat_id=chat_id, text=chunk)
+            logging.info(f"✅ {label} sent successfully")
+        except Exception as e:
+            logging.error(f"❌ {label} send error: {e}")
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Laporan gagal terkirim: {e}"
+                )
+            except Exception as e2:
+                logging.error(f"❌ {label} fallback error: {e2}")
+
+    await safe_send(MANAGEMENT_GROUP_ID, mgmt_report, "Management report")
+    await safe_send(SALES_GROUP_ID, sales_report, "Sales report")
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
